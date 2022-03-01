@@ -8,10 +8,14 @@ The directory `tensor_fusion` has the python package for tensor fusion networks 
 pip install -e .
 ```
 
-## Details
+## Detail
 
-`tensor_fusion/train.py` contains maximum a posteriori training of the networks.
+`train.py` contains maximum a posteriori training of the networks.
 
 ## Dataset
 
 CMU-MOSI-20: http://multicomp.cs.cmu.edu/resources/cmu-mosi-dataset/
+
+## Contact
+
+keonyonglee90@gmail.com
