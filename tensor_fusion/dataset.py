@@ -73,7 +73,7 @@ class BinaryMultimodalDataset(Dataset):
         label = self.labels[idx]
         return text, audio, vision, label
 
-def get_cmu_mosi_dataset(binary=False, path='../datasets/cmu-mosi/mosi_20_seq_data.pkl', device=None, dtype=None):
+def get_cmu_mosi_dataset(binary=False, path='/home/christian_lee/projects/datasets/cmu-mosi/mosi_20_seq_data.pkl', device=None, dtype=None):
     '''
     args:
         binary: binary dataset if True regression dataset if False

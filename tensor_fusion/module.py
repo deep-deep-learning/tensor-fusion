@@ -1,10 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from torch.distributions.half_cauchy import HalfCauchy
 from torch.distributions.normal import Normal
+
+import numpy as np
 from .distribution import LogUniform
+from . import low_rank_tensor as LowRankTensor
+
+from .tensor_times_matrix import tensor_times_matrix_fwd
 
 class TensorFusion(nn.Module):
 
@@ -89,28 +93,17 @@ class LowRankFusion(nn.Module):
 
         return output
 
-class AutoRankFusion(nn.Module):
+class AdaptiveRankFusion(nn.Module):
 
     def __init__(self, input_sizes, output_size, dropout=0.0, bias=True,
                  max_rank=20, prior_type='log_uniform', eta=None, 
                  device=None, dtype=None):
-        '''
-        args:
-            input_sizes: a tuple of ints, (input_size_1, input_size_2, ..., input_size_M)
-            output_sizes: an int, output size of the fusion layer
-            max_rank: an int, maximum rank for the CP decomposition
-            eta: a float, hyperparameter for rank parameter distribution
-            device:
-            dtype:
-        '''
+
         super().__init__()
 
         self.input_sizes = input_sizes
         self.output_size = output_size
         self.max_rank = max_rank
-        self.prior_type = prior_type
-        self.eta = eta
-
         self.dropout = nn.Dropout(dropout)
 
         # initialize weight tensor factors
@@ -118,17 +111,18 @@ class AutoRankFusion(nn.Module):
             for input_size in input_sizes]
         factors = factors + [nn.Parameter(torch.empty((output_size, max_rank), device=device, dtype=dtype))]
         
+        target_var = 1 / np.prod(input_sizes)
+        factor_std = (target_var / max_rank) ** (1 / (4 * 4))
         for factor in factors:
-            nn.init.xavier_normal_(factor)
+            nn.init.normal_(factor, 0, factor_std)
 
         self.weight_tensor_factors = nn.ParameterList(factors)
 
-        # initialize rank parameter and its prior
-        self.rank_parameter = nn.Parameter(torch.rand((max_rank,), device=device, dtype=dtype))
+        self.rank_parameters = nn.Parameter(torch.rand((max_rank,), device=device, dtype=dtype))
 
-        if self.prior_type == 'half_cauchy':
+        if prior_type == 'half_cauchy':
             self.rank_parameter_prior_distribution = HalfCauchy(eta)
-        elif self.prior_type == 'log_uniform':
+        elif prior_type == 'log_uniform':
             self.rank_parameter_prior_distribution = LogUniform(torch.tensor([1e-30], device=device, dtype=dtype), 
                                                                 torch.tensor([1e30], device=device, dtype=dtype))
 
@@ -137,10 +131,10 @@ class AutoRankFusion(nn.Module):
             self.bias = nn.Parameter(torch.zeros((output_size,), device=device, dtype=dtype))
         else:
             self.bias = None
-        
-    def forward(self, inputs):
 
-        # factorized forward propagation
+    def forward(self, inputs):
+        
+        # tensorized forward propagation
         output = 1.0
         for x, factor in zip(inputs, self.weight_tensor_factors[:-1]):
             output = output * (x @ factor)
@@ -156,16 +150,116 @@ class AutoRankFusion(nn.Module):
         return output
 
     def get_log_prior(self):
-
-        # clamp rank_param because <=0 is undefined 
-        clamped_rank_parameter = self.rank_parameter.clamp(1e-30)
-        self.rank_parameter.data = clamped_rank_parameter.data
         
-        log_prior = torch.sum(self.rank_parameter_prior_distribution.log_prob(self.rank_parameter))
+        # clamp rank_param because <=0 is undefined 
+        with torch.no_grad():
+            self.rank_parameters[:] = self.rank_parameters.clamp(1e-10, 1e10)
+        
+        # self.threshold(self.rank_parameter)
+        log_prior = torch.sum(self.rank_parameter_prior_distribution.log_prob(self.rank_parameters))
         
         # 0 mean normal distribution for the factors
-        factor_prior_distribution = Normal(0, self.rank_parameter)
+        factor_prior_distribution = Normal(0, self.rank_parameters)
         for factor in self.weight_tensor_factors:
-            log_prior = log_prior + torch.sum(factor_prior_distribution.log_prob(factor))
+            log_prior = log_prior + factor_prior_distribution.log_prob(factor).sum(0).sum()
         
         return log_prior
+    
+    def estimate_rank(self):
+        
+        rank = 0
+        for factor in self.weight_tensor_factors:
+            factor_rank = torch.sum(factor.var(axis=0) > 1e-5)
+            rank = max(rank, factor_rank)
+        
+        return rank
+
+class AdaptiveRankLinear(nn.Module):
+
+    def __init__(self, in_features, out_features, max_rank, bias=True, tensor_type='TT', prior_type='log_uniform',
+                 eta=None, device=None, dtype=None):
+
+        super().__init__()
+
+        self.weight_tensor = getattr(LowRankTensor, tensor_type)(in_features, out_features, max_rank, prior_type, eta, device, dtype)
+        
+       # initialize bias
+        if bias:
+            self.bias = nn.Parameter(torch.zeros((out_features,), device=device, dtype=dtype))
+        else:
+            self.bias = None
+
+    def forward(self, x):
+
+        output = tensor_times_matrix_fwd(self.weight_tensor.tensor, x.T)
+
+        if self.bias is not None:
+            output = output + self.bias
+            
+        return output
+
+    def get_log_prior(self):
+
+        return self.weight_tensor.get_log_prior()
+
+    def estimate_rank(self):
+
+        return self.weight_tensor.estimate_rank()
+
+class AdaptiveRankLSTM(nn.Module):
+    '''
+    no frills batch first LSTM implementation
+    '''
+    def __init__(self, input_size, hidden_size, max_rank, bias=True,
+                 tensor_type='TT', prior_type='log_uniform', eta=None,
+                 device=None, dtype=None):
+        '''
+        args:
+            input_size: input dimension size
+            hidden_size: hidden dimension size
+            max_rank: maximum rank for LSTM's weight tensor
+            tensor_type: LSTM's weight tensor type 'CP', 'Tucker', 'TT' or 'TTM'
+            prior_type: prior for the rank parameter 'log_uniform' or 'half_cauchy'
+            eta: hyperparameter for the 'half_cauchy' distribution
+            device:
+            dtype:
+        '''
+        
+        super().__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        self.layer_ih = AdaptiveRankLinear(input_size, hidden_size*4, max_rank, bias, 
+                                           tensor_type, prior_type, eta, device, dtype)
+        self.layer_hh = AdaptiveRankLinear(hidden_size, hidden_size*4, max_rank, bias,
+                                           tensor_type, prior_type, eta, device, dtype)
+        
+    def forward(self, x):
+
+        # LSTM forward propagation
+        output = []
+        batch_size = x.shape[0]
+        seq_length = x.shape[1]
+        
+        c = torch.zeros((batch_size, self.hidden_size), device=x.device, dtype=x.dtype)
+        h = torch.zeros((batch_size, self.hidden_size), device=x.device, dtype=x.dtype)
+        for seq in range(seq_length):
+            ih = self.layer_ih(x[:,seq,:])
+            hh = self.layer_hh(h)
+            i, f, g, o = torch.split(ih + hh, self.hidden_size, 1)
+            i = torch.sigmoid(i)
+            f = torch.sigmoid(f)
+            g = torch.tanh(g)
+            o = torch.sigmoid(o)
+            c = f * c + i * g
+            h = o * torch.tanh(c)
+            output.append(h.unsqueeze(1))
+            
+        output = torch.cat(output, dim=1)
+        
+        return output, (h, c)
+
+    def get_log_prior(self):
+
+        return self.layer_ih.get_log_prior() + self.layer_hh.get_log_prior()
